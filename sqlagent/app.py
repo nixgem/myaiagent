@@ -1,19 +1,60 @@
 import sqlite3
+import ollama
+import re
 
 conn = sqlite3.connect("sample.db")
 conn.row_factory = sqlite3.Row
 
+def strip_sql_comments_and_strings(sql: str) -> str:
+    # 文字列リテラルを除去: '...'
+    sql = re.sub(r"'(?:''|[^'])*'", "''", sql)
+
+    # 行コメントを除去: -- ...
+    sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
+
+    # ブロックコメントを除去: /* ... */
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+
+    return sql
 
 def run_sql(sql: str):
     rows = conn.execute(sql).fetchall()
     return [dict(r) for r in rows]
 
+def clean_sql(text: str) -> str:
+    text = text.strip()
 
-def is_safe_sql(sql: str) -> bool:
-    s = sql.lower().strip()
+    # ```sql で始まるコードブロックを除去
+    if text.startswith("```sql"):
+        text = text[len("```sql"):].strip()
 
-    if not s.startswith("select"):
-        return False
+    # ``` で始まるコードブロックも除去
+    if text.startswith("```"):
+        text = text[len("```"):].strip()
+
+    # 末尾の ``` を除去
+    if text.endswith("```"):
+        text = text[:-3].strip()
+
+    return text
+
+def is_safe_sql(sql: str) -> tuple[bool, str]:
+    s = sql.strip()
+
+    # 末尾の ; は許可
+    if s.endswith(";"):
+        s = s[:-1].strip()
+
+    # まずは元の文で複文チェック
+    if ";" in s:
+        return False, "複数文は禁止"
+
+    # 判定用に小文字化 + コメント/文字列除去
+    normalized = strip_sql_comments_and_strings(s).lower().strip()
+
+    # SELECT文のみ許可
+    if not normalized.startswith("select"):
+        return False, "SELECT文以外は禁止"
 
     ng_words = [
         "insert", "update", "delete", "drop",
@@ -21,71 +62,68 @@ def is_safe_sql(sql: str) -> bool:
     ]
 
     for word in ng_words:
-        if word in s:
-            return False
+        if re.search(rf"\b{word}\b", normalized):
+            return False, f"禁止キーワード: {word}"
 
-    if ";" in s:
-        return False
-
-    return True
-
+    return True, "OK"
 
 def make_sql(question: str) -> str:
-    q = question.strip()
+    prompt = f"""
+あなたはSQLite用のSQL作成アシスタントです。
+以下の質問に対して、必ずSQLだけを返してください。
+説明文は不要です。
+SELECT文だけを返してください。
 
-    if "売上合計" in q or "合計売上" in q:
-        return "SELECT SUM(amount) AS total_amount FROM sales"
+使ってよいテーブルは sales だけです。
 
-    if "一覧" in q:
-        return "SELECT * FROM sales LIMIT 5"
+sales テーブルのカラム:
+- order_id
+- order_date
+- customer_name
+- product_name
+- amount
 
-    if "顧客別" in q:
-        return """
-        SELECT customer_name, SUM(amount) AS total_amount
-        FROM sales
-        GROUP BY customer_name
-        ORDER BY total_amount DESC
-        LIMIT 10
-        """.strip()
+質問:
+{question}
+"""
 
-    if "商品別" in q:
-        return """
-        SELECT product_name, SUM(amount) AS total_amount
-        FROM sales
-        GROUP BY product_name
-        ORDER BY total_amount DESC
-        LIMIT 10
-        """.strip()
+    response = ollama.chat(
+        model="gemma3",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    )
 
-    if "3月2日" in q:
-        return """
-        SELECT *
-        FROM sales
-        WHERE order_date = '2026-03-02'
-        LIMIT 10
-        """.strip()
-
-    return "SELECT * FROM sales LIMIT 5"
+    raw = response["message"]["content"]
+    sql = clean_sql(raw)
+    return sql
 
 
-while True:
-    question = input("質問 > ").strip()
+def main():
+    while True:
+        question = input("質問(終了はexitを入力) > ").strip()
 
-    if question == "exit":
-        print("終了します")
-        break
+        if question == "exit":
+            print("終了します")
+            break
 
-    sql = make_sql(question)
-    print(f"[生成SQL] {sql}")
+        sql = make_sql(question)
+        print(f"[生成SQL] {sql}")
 
-    if not is_safe_sql(sql):
-        print("[エラー] 安全ではないSQLなので実行を止めました")
-        continue
+        if not is_safe_sql(sql):
+            print("[エラー] 安全ではないSQLなので実行を止めました")
+            continue
 
-    try:
-        result = run_sql(sql)
-        print("[結果]")
-        for row in result:
-            print(row)
-    except Exception as e:
-        print("[実行エラー]", e)
+        try:
+            result = run_sql(sql)
+            print("[結果]")
+            for row in result:
+                print(row)
+        except Exception as e:
+            print("[実行エラー]", e)
+
+if __name__ == "__main__":
+    main()
